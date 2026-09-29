@@ -1,0 +1,330 @@
+'use client';
+
+import { useEffect, useRef, useState } from 'react';
+import Link from 'next/link';
+import { QRCodeSVG } from 'qrcode.react';
+import { supabase } from '../../lib/supabaseClient';
+
+function minutesSince(iso, now) {
+  const diff = now - new Date(iso).getTime();
+  return Math.max(0, Math.floor(diff / 60000));
+}
+
+export default function GenerateQrPage() {
+  const [tableNumber, setTableNumber] = useState('');
+  const [adultCount, setAdultCount] = useState('');
+  const [childCount, setChildCount] = useState('');
+
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  // Session เดิมที่ยังเปิดค้างอยู่ (ถ้ามี) -> แสดงกล่องเตือน
+  const [existing, setExisting] = useState(null);
+  const [showConfirm, setShowConfirm] = useState(false);
+  const [confirmNow, setConfirmNow] = useState(0);
+  const [closing, setClosing] = useState(false);
+  const [confirmError, setConfirmError] = useState('');
+
+  // ผลลัพธ์หลังเปิดโต๊ะสำเร็จ
+  const [result, setResult] = useState(null);
+
+  const cancelBtnRef = useRef(null);
+
+  // ปิด dialog ด้วยปุ่ม Esc + โฟกัสที่ปุ่มยกเลิกตอนเปิด
+  useEffect(() => {
+    if (!showConfirm) return;
+    cancelBtnRef.current?.focus();
+    const onKey = (e) => {
+      if (e.key === 'Escape' && !closing) setShowConfirm(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [showConfirm, closing]);
+
+  function clearWarning() {
+    setExisting(null);
+    setShowConfirm(false);
+    setConfirmError('');
+  }
+
+  function handleTableChange(value) {
+    setTableNumber(value);
+    // เปลี่ยนเลขโต๊ะแล้ว คำเตือนของโต๊ะเดิมไม่เกี่ยวข้องอีก
+    if (existing) clearWarning();
+  }
+
+  async function handleOpenTable(e) {
+    e.preventDefault();
+    setError('');
+
+    const table = Number(tableNumber);
+    const adults = Number(adultCount || 0);
+    const children = Number(childCount || 0);
+
+    if (!Number.isInteger(table) || table < 1) {
+      setError('กรุณากรอกเลขโต๊ะเป็นตัวเลขตั้งแต่ 1 ขึ้นไป');
+      return;
+    }
+    if (
+      !Number.isInteger(adults) ||
+      !Number.isInteger(children) ||
+      adults < 0 ||
+      children < 0
+    ) {
+      setError('จำนวนผู้ใหญ่และเด็กต้องเป็นจำนวนเต็มตั้งแต่ 0 ขึ้นไป');
+      return;
+    }
+    if (adults + children < 1) {
+      setError('ต้องมีลูกค้าอย่างน้อย 1 คน');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      // 1) เช็คว่าโต๊ะนี้มี session ที่ยัง open อยู่หรือไม่
+      const { data: openRows, error: checkError } = await supabase
+        .from('sessions')
+        .select('id, adult_count, child_count, created_at')
+        .eq('table_number', table)
+        .eq('status', 'open')
+        .order('created_at', { ascending: false })
+        .limit(1);
+
+      if (checkError) throw checkError;
+
+      if (openRows && openRows.length > 0) {
+        setExisting({ ...openRows[0], table_number: table });
+        return;
+      }
+
+      // 2) ไม่มี -> สร้าง session ใหม่
+      const { data: created, error: insertError } = await supabase
+        .from('sessions')
+        .insert({
+          table_number: table,
+          adult_count: adults,
+          child_count: children,
+          status: 'open',
+        })
+        .select('id')
+        .single();
+
+      if (insertError) throw insertError;
+
+      setResult({
+        id: created.id,
+        table_number: table,
+        adult_count: adults,
+        child_count: children,
+        url: `${window.location.origin}/order/${table}`,
+      });
+    } catch (err) {
+      console.error(err);
+      setError('เกิดข้อผิดพลาดในการเชื่อมต่อฐานข้อมูล กรุณาลองใหม่อีกครั้ง');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function openConfirm() {
+    setConfirmError('');
+    setConfirmNow(Date.now());
+    setShowConfirm(true);
+  }
+
+  async function handleConfirmClose() {
+    if (!existing) return;
+    setClosing(true);
+    setConfirmError('');
+    try {
+      // อัปเดตเฉพาะแถวนี้ และเช็คซ้ำว่ายังเป็น 'open' อยู่
+      const { error: updateError } = await supabase
+        .from('sessions')
+        .update({ status: 'closed' })
+        .eq('id', existing.id)
+        .eq('status', 'open')
+        .select('id');
+
+      if (updateError) throw updateError;
+
+      // สำเร็จ (หรือมีคนปิดไปก่อนแล้ว ซึ่งผลลัพธ์เหมือนกัน):
+      // ปิด dialog, เอากล่องเตือนออก, กลับไปที่ฟอร์ม (ค่าที่กรอกยังอยู่)
+      clearWarning();
+    } catch (err) {
+      console.error(err);
+      setConfirmError('ปิดโต๊ะเดิมไม่สำเร็จ กรุณาลองใหม่อีกครั้ง');
+    } finally {
+      setClosing(false);
+    }
+  }
+
+  function resetAll() {
+    setResult(null);
+    setTableNumber('');
+    setAdultCount('');
+    setChildCount('');
+    setError('');
+    clearWarning();
+  }
+
+  // ---------- ผลลัพธ์ QR ----------
+  if (result) {
+    return (
+      <main className="staff-page">
+        <div className="staff-card qr-card">
+          <h1>เปิดโต๊ะ {result.table_number} แล้ว</h1>
+          <p className="muted">
+            ผู้ใหญ่ {result.adult_count} คน · เด็ก {result.child_count} คน
+          </p>
+          <div className="qr-box">
+            <QRCodeSVG value={result.url} size={240} marginSize={2} />
+          </div>
+          <p className="muted">ให้ลูกค้าสแกน QR นี้เพื่อสั่งอาหาร</p>
+          <p className="url-text">{result.url}</p>
+          <button type="button" className="btn btn-primary" onClick={resetAll}>
+            เปิดโต๊ะอื่น
+          </button>
+        </div>
+      </main>
+    );
+  }
+
+  // ---------- ฟอร์ม ----------
+  return (
+    <main className="staff-page">
+      <div className="staff-card">
+        <Link href="/" className="back-link">
+          กลับหน้าแรก
+        </Link>
+        <h1>เปิดโต๊ะ</h1>
+
+        <form onSubmit={handleOpenTable} noValidate>
+          <div className="field">
+            <label htmlFor="table">เลขโต๊ะ</label>
+            <input
+              id="table"
+              type="number"
+              inputMode="numeric"
+              min="1"
+              value={tableNumber}
+              onChange={(e) => handleTableChange(e.target.value)}
+              required
+            />
+          </div>
+          <div className="field-row">
+            <div className="field">
+              <label htmlFor="adults">ผู้ใหญ่ (คน)</label>
+              <input
+                id="adults"
+                type="number"
+                inputMode="numeric"
+                min="0"
+                value={adultCount}
+                onChange={(e) => setAdultCount(e.target.value)}
+              />
+            </div>
+            <div className="field">
+              <label htmlFor="children">เด็ก (คน)</label>
+              <input
+                id="children"
+                type="number"
+                inputMode="numeric"
+                min="0"
+                value={childCount}
+                onChange={(e) => setChildCount(e.target.value)}
+              />
+            </div>
+          </div>
+
+          {error && (
+            <p className="form-error" role="alert">
+              {error}
+            </p>
+          )}
+
+          <button
+            type="submit"
+            className="btn btn-primary btn-block"
+            disabled={loading}
+          >
+            {loading ? 'กำลังตรวจสอบ...' : 'เปิดโต๊ะ'}
+          </button>
+        </form>
+
+        {existing && (
+          <div className="warn-box" role="alert">
+            <p>โต๊ะนี้มีลูกค้าอยู่ระหว่างทานอาหาร กรุณาปิดออเดอร์เดิมก่อน</p>
+            <button
+              type="button"
+              className="btn btn-outline"
+              onClick={openConfirm}
+            >
+              ปิดออเดอร์เดิม
+            </button>
+          </div>
+        )}
+      </div>
+
+      {showConfirm && existing && (
+        <div
+          className="modal-backdrop"
+          onClick={() => !closing && setShowConfirm(false)}
+        >
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="confirm-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 id="confirm-title">ยืนยันปิดโต๊ะเดิม</h2>
+            <dl className="detail-list">
+              <div>
+                <dt>เลขโต๊ะ</dt>
+                <dd>{existing.table_number}</dd>
+              </div>
+              <div>
+                <dt>ผู้ใหญ่</dt>
+                <dd>{existing.adult_count} คน</dd>
+              </div>
+              <div>
+                <dt>เด็ก</dt>
+                <dd>{existing.child_count} คน</dd>
+              </div>
+              <div>
+                <dt>เปิดมาแล้ว</dt>
+                <dd>{minutesSince(existing.created_at, confirmNow)} นาที</dd>
+              </div>
+            </dl>
+
+            {confirmError && (
+              <p className="form-error" role="alert">
+                {confirmError}
+              </p>
+            )}
+
+            <div className="modal-actions">
+              <button
+                type="button"
+                ref={cancelBtnRef}
+                className="btn btn-outline"
+                onClick={() => setShowConfirm(false)}
+                disabled={closing}
+              >
+                ยกเลิก
+              </button>
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={handleConfirmClose}
+                disabled={closing}
+              >
+                {closing ? 'กำลังปิด...' : 'ยืนยันปิดโต๊ะเดิม'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </main>
+  );
+}
